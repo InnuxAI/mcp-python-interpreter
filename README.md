@@ -68,7 +68,7 @@ For Windows:
         "/path/to/your/python"
       ],
         "env": {
-            "MCP_ALLOW_SYSTEM_ACCESS": 0
+            "MCP_ALLOW_SYSTEM_ACCESS": "0"
         },
     }
   }

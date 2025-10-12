@@ -2,27 +2,28 @@
 MCP Python Interpreter
 
 A Model Context Protocol server for interacting with Python environments 
-and executing Python code. All operations are confined to a specified working directory
-or allowed system-wide if explicitly enabled.
+and executing Python code. Supports both in-process execution (default, fast)
+and subprocess execution (for environment isolation).
 """
 
 import os
 import sys
 import json
-import glob
 import subprocess
 import tempfile
 import argparse
+import traceback
+import builtins
 from pathlib import Path
-from typing import Dict, List, Optional, Union, Any
+from io import StringIO
+from typing import Dict, List, Optional, Any
 import asyncio
-import inspect
+import concurrent.futures
 
-# Import FastMCP for building our server
-from mcp.server.fastmcp import FastMCP, Context, Image
+# Import MCP SDK
+from mcp.server.fastmcp import FastMCP
 
-# Parse command line arguments to get the working directory
-# Use a default value that works when run via uvx
+# Parse command line arguments
 parser = argparse.ArgumentParser(description='MCP Python Interpreter')
 parser.add_argument('--dir', type=str, default=os.getcwd(),
                     help='Working directory for code execution and file operations')
@@ -30,60 +31,293 @@ parser.add_argument('--python-path', type=str, default=None,
                     help='Custom Python interpreter path to use as default')
 args, unknown = parser.parse_known_args()
 
-# Check if system-wide access is enabled via environment variable
+# Configuration
 ALLOW_SYSTEM_ACCESS = os.environ.get('MCP_ALLOW_SYSTEM_ACCESS', 'false').lower() in ('true', '1', 'yes')
-
-# Set and create working directory
 WORKING_DIR = Path(args.dir).absolute()
 WORKING_DIR.mkdir(parents=True, exist_ok=True)
-
-# Set default Python path
 DEFAULT_PYTHON_PATH = args.python_path if args.python_path else sys.executable
 
-# Print startup message to stderr (doesn't interfere with MCP protocol)
+# Startup message
 print(f"MCP Python Interpreter starting in directory: {WORKING_DIR}", file=sys.stderr)
 print(f"Using default Python interpreter: {DEFAULT_PYTHON_PATH}", file=sys.stderr)
 print(f"System-wide file access: {'ENABLED' if ALLOW_SYSTEM_ACCESS else 'DISABLED'}", file=sys.stderr)
+print(f"Platform: {sys.platform}", file=sys.stderr)
 
-# Create our MCP server
-mcp = FastMCP(
-    "Python Interpreter",
-    description=f"Execute Python code, access Python environments, and manage Python files{' system-wide' if ALLOW_SYSTEM_ACCESS else f' in directory: {WORKING_DIR}'}",
-    dependencies=["mcp[cli]"]
-)
+# Create MCP server
+mcp = FastMCP("python-interpreter")
+
+# Thread pool for subprocess fallback
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+# ============================================================================
+# REPL Session Management (for in-process execution)
+# ============================================================================
+
+class ReplSession:
+    """Manages a Python REPL session with persistent state."""
+    
+    def __init__(self):
+        self.locals = {
+            "__builtins__": builtins,
+            "__name__": "__main__",
+            "__doc__": None,
+            "__package__": None,
+        }
+        self.history = []
+        
+    def execute(self, code: str, timeout: Optional[int] = None) -> Dict[str, Any]:
+        """
+        Execute Python code in this session.
+        
+        Args:
+            code: Python code to execute
+            timeout: Optional timeout (not enforced for inline execution)
+            
+        Returns:
+            Dict with stdout, stderr, result, and status
+        """
+        stdout_capture = StringIO()
+        stderr_capture = StringIO()
+        
+        # Save original streams
+        old_stdout, old_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = stdout_capture, stderr_capture
+        
+        result_value = None
+        status = 0
+        
+        try:
+            # Change to working directory for execution
+            old_cwd = os.getcwd()
+            os.chdir(WORKING_DIR)
+            
+            try:
+                # Try to evaluate as expression first
+                try:
+                    result_value = eval(code, self.locals)
+                    if result_value is not None:
+                        print(repr(result_value))
+                except SyntaxError:
+                    # If not an expression, execute as statement
+                    exec(code, self.locals)
+                    
+            except Exception:
+                traceback.print_exc()
+                status = 1
+            finally:
+                os.chdir(old_cwd)
+                
+        finally:
+            # Restore original streams
+            sys.stdout, sys.stderr = old_stdout, old_stderr
+            
+        return {
+            "stdout": stdout_capture.getvalue(),
+            "stderr": stderr_capture.getvalue(),
+            "result": result_value,
+            "status": status
+        }
+
+# Global sessions storage
+_sessions: Dict[str, ReplSession] = {}
+
+def get_session(session_id: str = "default") -> ReplSession:
+    """Get or create a REPL session."""
+    if session_id not in _sessions:
+        _sessions[session_id] = ReplSession()
+    return _sessions[session_id]
 
 # ============================================================================
 # Helper functions
 # ============================================================================
 
 def is_path_allowed(path: Path) -> bool:
-    """
-    Check if a path is allowed based on security settings.
-    
-    Args:
-        path: Path to check
-        
-    Returns:
-        bool: True if path is allowed, False otherwise
-    """
+    """Check if a path is allowed based on security settings."""
     if ALLOW_SYSTEM_ACCESS:
         return True
     
-    return str(path).startswith(str(WORKING_DIR))
+    try:
+        path.resolve().relative_to(WORKING_DIR.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _run_subprocess_sync(
+    cmd: List[str],
+    cwd: Optional[str] = None,
+    timeout: int = 300
+) -> Dict[str, Any]:
+    """Synchronous subprocess execution for Windows compatibility."""
+    try:
+        creation_flags = 0
+        if sys.platform == "win32":
+            creation_flags = subprocess.CREATE_NO_WINDOW
+            try:
+                creation_flags |= subprocess.CREATE_NEW_PROCESS_GROUP
+            except AttributeError:
+                pass
+        
+        result = subprocess.run(
+            cmd,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            creationflags=creation_flags if sys.platform == "win32" else 0,
+            encoding='utf-8',
+            errors='replace',
+            stdin=subprocess.DEVNULL
+        )
+        
+        return {
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "status": result.returncode
+        }
+        
+    except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode('utf-8', errors='replace') if e.stdout else ""
+        stderr = e.stderr.decode('utf-8', errors='replace') if e.stderr else ""
+        
+        return {
+            "stdout": stdout,
+            "stderr": stderr + f"\nExecution timed out after {timeout} seconds",
+            "status": -1
+        }
+        
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": f"Error executing command: {str(e)}",
+            "status": -1
+        }
+
+
+async def run_subprocess_async(
+    cmd: List[str],
+    cwd: Optional[str] = None,
+    timeout: int = 300,
+    input_data: Optional[str] = None
+) -> Dict[str, Any]:
+    """Run subprocess with Windows compatibility."""
+    
+    # On Windows, use thread pool for reliability
+    if sys.platform == "win32":
+        if input_data:
+            print("Warning: input_data not supported on Windows sync mode", file=sys.stderr)
+        
+        loop = asyncio.get_event_loop()
+        from functools import partial
+        func = partial(_run_subprocess_sync, cmd, cwd, timeout)
+        result = await loop.run_in_executor(_executor, func)
+        return result
+    
+    # On Unix, use asyncio
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            stdin=asyncio.subprocess.PIPE if input_data else asyncio.subprocess.DEVNULL,
+            cwd=cwd
+        )
+        
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(input=input_data.encode('utf-8') if input_data else None),
+                timeout=timeout
+            )
+            
+            return {
+                "stdout": stdout.decode('utf-8', errors='replace'),
+                "stderr": stderr.decode('utf-8', errors='replace'),
+                "status": process.returncode
+            }
+            
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+                await process.wait()
+            except:
+                pass
+            
+            return {
+                "stdout": "",
+                "stderr": f"Execution timed out after {timeout} seconds",
+                "status": -1
+            }
+            
+    except Exception as e:
+        return {
+            "stdout": "",
+            "stderr": f"Error executing command: {str(e)}",
+            "status": -1
+        }
+
+
+async def execute_python_code_subprocess(
+    code: str, 
+    python_path: Optional[str] = None,
+    working_dir: Optional[str] = None,
+    timeout: int = 300
+) -> Dict[str, Any]:
+    """Execute Python code via subprocess (for environment isolation)."""
+    if python_path is None:
+        python_path = DEFAULT_PYTHON_PATH
+    
+    temp_file = None
+    try:
+        fd, temp_file = tempfile.mkstemp(suffix='.py', text=True)
+        
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                f.write(code)
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            os.close(fd)
+            raise e
+        
+        if sys.platform == "win32":
+            await asyncio.sleep(0.05)
+            temp_file = os.path.abspath(temp_file)
+            if working_dir:
+                working_dir = os.path.abspath(working_dir)
+        
+        result = await run_subprocess_async(
+            [python_path, temp_file],
+            cwd=working_dir,
+            timeout=timeout
+        )
+        
+        return result
+        
+    finally:
+        if temp_file:
+            try:
+                if sys.platform == "win32":
+                    await asyncio.sleep(0.05)
+                
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception as e:
+                print(f"Warning: Could not delete temp file {temp_file}: {e}", file=sys.stderr)
+
 
 def get_python_environments() -> List[Dict[str, str]]:
-    """Get all available Python environments (system and conda)."""
+    """Get all available Python environments."""
     environments = []
     
-    # Add default Python if a custom path was specified
     if DEFAULT_PYTHON_PATH != sys.executable:
         try:
-            # Get Python version
-            version_result = subprocess.run(
+            result = subprocess.run(
                 [DEFAULT_PYTHON_PATH, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"],
-                capture_output=True, text=True, check=True
+                capture_output=True, text=True, check=True, timeout=10,
+                stdin=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
-            version = version_result.stdout.strip()
+            version = result.stdout.strip()
             
             environments.append({
                 "name": "default",
@@ -91,21 +325,21 @@ def get_python_environments() -> List[Dict[str, str]]:
                 "version": version
             })
         except Exception as e:
-            print(f"Error getting version for custom Python path: {e}")
+            print(f"Error getting version for custom Python path: {e}", file=sys.stderr)
     
-    # Add system Python
     environments.append({
         "name": "system",
         "path": sys.executable,
         "version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
     })
     
-    # Try to find conda environments
+    # Try conda environments
     try:
-        # Check if conda is available
         result = subprocess.run(
             ["conda", "info", "--envs", "--json"],
-            capture_output=True, text=True, check=False
+            capture_output=True, text=True, check=False, timeout=10,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         )
         
         if result.returncode == 0:
@@ -115,17 +349,17 @@ def get_python_environments() -> List[Dict[str, str]]:
                 if env_name == "base":
                     env_name = "conda-base"
                 
-                # Get Python executable path and version
                 python_path = os.path.join(env, "bin", "python")
                 if not os.path.exists(python_path):
-                    python_path = os.path.join(env, "python.exe")  # Windows
+                    python_path = os.path.join(env, "python.exe")
                 
                 if os.path.exists(python_path):
-                    # Get Python version
                     try:
                         version_result = subprocess.run(
                             [python_path, "-c", "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')"],
-                            capture_output=True, text=True, check=True
+                            capture_output=True, text=True, check=True, timeout=10,
+                            stdin=subprocess.DEVNULL,
+                            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
                         )
                         version = version_result.stdout.strip()
                         
@@ -135,77 +369,36 @@ def get_python_environments() -> List[Dict[str, str]]:
                             "version": version
                         })
                     except Exception:
-                        # Skip environments where we can't get the version
                         pass
     except Exception as e:
-        print(f"Error getting conda environments: {e}")
+        print(f"Error getting conda environments: {e}", file=sys.stderr)
     
     return environments
+
 
 def get_installed_packages(python_path: str) -> List[Dict[str, str]]:
     """Get installed packages for a specific Python environment."""
     try:
         result = subprocess.run(
             [python_path, "-m", "pip", "list", "--format=json"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
         )
         return json.loads(result.stdout)
     except Exception as e:
-        print(f"Error getting installed packages: {e}")
+        print(f"Error getting installed packages: {e}", file=sys.stderr)
         return []
 
-def execute_python_code(
-    code: str, 
-    python_path: Optional[str] = None,
-    working_dir: Optional[str] = None
-) -> Dict[str, Any]:
-    """
-    Execute Python code and return the result.
-    
-    Args:
-        code: Python code to execute
-        python_path: Path to Python executable (default: custom or system Python)
-        working_dir: Working directory for execution
-        
-    Returns:
-        Dict with stdout, stderr, and status
-    """
-    if python_path is None:
-        python_path = DEFAULT_PYTHON_PATH
-    
-    # Create a temporary file for the code
-    with tempfile.NamedTemporaryFile(suffix='.py', mode='w', delete=False) as temp:
-        temp.write(code)
-        temp_path = temp.name
-    
-    try:
-        result = subprocess.run(
-            [python_path, temp_path],
-            capture_output=True, text=True,
-            cwd=working_dir
-        )
-        
-        return {
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "status": result.returncode
-        }
-    finally:
-        # Clean up temp file
-        try:
-            os.unlink(temp_path)
-        except Exception:
-            pass
 
-def find_python_files(directory: str or Path) -> List[Dict[str, str]]:
-    """Find all Python files in a directory and its subdirectories."""
+def find_python_files(directory: Path) -> List[Dict[str, str]]:
+    """Find all Python files in a directory."""
     files = []
     
-    directory_path = Path(directory)
-    if not directory_path.exists():
-        return files  # Return empty list instead of throwing error
+    if not directory.exists():
+        return files
     
-    for path in directory_path.rglob("*.py"):
+    for path in directory.rglob("*.py"):
         if path.is_file():
             files.append({
                 "path": str(path),
@@ -215,6 +408,7 @@ def find_python_files(directory: str or Path) -> List[Dict[str, str]]:
             })
     
     return files
+
 
 # ============================================================================
 # Resources
@@ -226,12 +420,12 @@ def get_environments_resource() -> str:
     environments = get_python_environments()
     return json.dumps(environments, indent=2)
 
+
 @mcp.resource("python://packages/{env_name}")
 def get_packages_resource(env_name: str) -> str:
     """List installed packages for a specific environment as a resource."""
     environments = get_python_environments()
     
-    # Find the requested environment
     env = next((e for e in environments if e["name"] == env_name), None)
     if not env:
         return json.dumps({"error": f"Environment '{env_name}' not found"})
@@ -239,121 +433,6 @@ def get_packages_resource(env_name: str) -> str:
     packages = get_installed_packages(env["path"])
     return json.dumps(packages, indent=2)
 
-@mcp.resource("python://file")
-def get_file_in_current_dir() -> str:
-    """List Python files in the current working directory."""
-    files = find_python_files(WORKING_DIR)
-    return json.dumps(files, indent=2)
-
-@mcp.tool()
-def read_file(file_path: str, max_size_kb: int = 1024) -> str:
-    """
-    Read the content of any file, with size limits for safety.
-    
-    Args:
-        file_path: Path to the file (relative to working directory or absolute)
-        max_size_kb: Maximum file size to read in KB (default: 1024)
-    
-    Returns:
-        str: File content or an error message
-    """
-    # Handle path based on security settings
-    path = Path(file_path)
-    if path.is_absolute():
-        if not is_path_allowed(path):
-            return f"Access denied: System-wide file access is {'DISABLED' if not ALLOW_SYSTEM_ACCESS else 'ENABLED, but this path is not allowed'}"
-    else:
-        # Make path relative to working directory if it's not already absolute
-        path = WORKING_DIR / path
-    
-    try:
-        if not path.exists():
-            return f"Error: File '{file_path}' not found"
-        
-        # Check file size
-        file_size_kb = path.stat().st_size / 1024
-        if file_size_kb > max_size_kb:
-            return f"Error: File size ({file_size_kb:.2f} KB) exceeds maximum allowed size ({max_size_kb} KB)"
-        
-        # Determine file type and read accordingly
-        try:
-            # Try to read as text first
-            with open(path, 'r', encoding='utf-8') as f:
-                content = f.read()
-            
-            # If it's a known source code type, use code block formatting
-            source_code_extensions = ['.py', '.js', '.html', '.css', '.json', '.xml', '.md', '.txt', '.sh', '.c', '.cpp', '.java', '.rb']
-            if path.suffix.lower() in source_code_extensions:
-                file_type = path.suffix[1:] if path.suffix else 'plain'
-                return f"File: {file_path}\n\n```{file_type}\n{content}\n```"
-            
-            # For other text files, return as-is
-            return f"File: {file_path}\n\n{content}"
-        
-        except UnicodeDecodeError:
-            # If text decoding fails, read as binary and show hex representation
-            with open(path, 'rb') as f:
-                content = f.read()
-                hex_content = content.hex()
-                return f"Binary file: {file_path}\nFile size: {len(content)} bytes\nHex representation (first 1024 chars):\n{hex_content[:1024]}"
-    
-    except Exception as e:
-        return f"Error reading file {file_path}: {str(e)}"
-
-@mcp.tool()
-def write_file(
-    file_path: str,
-    content: str,
-    overwrite: bool = False,
-    encoding: str = 'utf-8'
-) -> str:
-    """
-    Write content to a file in the working directory or system-wide if allowed.
-    
-    Args:
-        file_path: Path to the file to write (relative to working directory or absolute if system access is enabled)
-        content: Content to write to the file
-        overwrite: Whether to overwrite the file if it exists (default: False)
-        encoding: File encoding (default: utf-8)
-    
-    Returns:
-        str: Status message about the file writing operation
-    """
-    # Handle path based on security settings
-    path = Path(file_path)
-    if path.is_absolute():
-        if not is_path_allowed(path):
-            return f"For security reasons, you can only write files inside the working directory: {WORKING_DIR} (System-wide access is disabled)"
-    else:
-        # Make path relative to working directory if it's not already
-        path = WORKING_DIR / path
-    
-    try:
-        # Check if the file exists
-        if path.exists() and not overwrite:
-            return f"File '{path}' already exists. Use overwrite=True to replace it."
-        
-        # Create directory if it doesn't exist
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Determine write mode based on content type
-        if isinstance(content, str):
-            # Text content
-            with open(path, 'w', encoding=encoding) as f:
-                f.write(content)
-        elif isinstance(content, bytes):
-            # Binary content
-            with open(path, 'wb') as f:
-                f.write(content)
-        else:
-            return f"Unsupported content type: {type(content)}"
-        
-        # Get file information
-        file_size_kb = path.stat().st_size / 1024
-        return f"Successfully wrote to {path}. File size: {file_size_kb:.2f} KB"
-    
-    except Exception as e:
-        return f"Error writing to file: {str(e)}"
 
 @mcp.resource("python://directory")
 def get_working_directory_listing() -> str:
@@ -365,80 +444,21 @@ def get_working_directory_listing() -> str:
             "files": files
         }, indent=2)
     except Exception as e:
-        return f"Error listing directory: {str(e)}"
+        return json.dumps({"error": f"Error listing directory: {str(e)}"})
 
-@mcp.tool()
-def list_directory(directory_path: str = "") -> str:
-    """
-    List all Python files in a directory or subdirectory.
+
+@mcp.resource("python://session/{session_id}/history")
+def get_session_history(session_id: str) -> str:
+    """Get execution history for a REPL session."""
+    if session_id not in _sessions:
+        return json.dumps({"error": f"Session '{session_id}' not found"})
     
-    Args:
-        directory_path: Path to directory (relative to working directory or absolute, empty for working directory)
-    """
-    try:
-        # Handle empty path (use working directory)
-        if not directory_path:
-            path = WORKING_DIR
-        else:
-            # Handle absolute paths
-            path = Path(directory_path)
-            if path.is_absolute():
-                if not is_path_allowed(path):
-                    return f"Access denied: System-wide file access is {'DISABLED' if not ALLOW_SYSTEM_ACCESS else 'ENABLED, but this path is not allowed'}"
-            else:
-                # Make path relative to working directory if it's not already absolute
-                path = WORKING_DIR / directory_path
-                
-        # Check if directory exists
-        if not path.exists():
-            return f"Error: Directory '{directory_path}' not found"
-            
-        if not path.is_dir():
-            return f"Error: '{directory_path}' is not a directory"
-            
-        files = find_python_files(path)
-        
-        if not files:
-            return f"No Python files found in {directory_path or 'working directory'}"
-            
-        result = f"Python files in directory: {directory_path or str(WORKING_DIR)}\n\n"
-        
-        # Group files by subdirectory for better organization
-        files_by_dir = {}
-        base_dir = path if ALLOW_SYSTEM_ACCESS else WORKING_DIR
-        
-        for file in files:
-            file_path = Path(file["path"])
-            try:
-                relative_path = file_path.relative_to(base_dir)
-                parent = str(relative_path.parent)
-                
-                if parent == ".":
-                    parent = "(root)"
-            except ValueError:
-                # This can happen with system-wide access enabled
-                parent = str(file_path.parent)
-                
-            if parent not in files_by_dir:
-                files_by_dir[parent] = []
-                
-            files_by_dir[parent].append({
-                "name": file["name"],
-                "size": file["size"],
-                "modified": file["modified"]
-            })
-            
-        # Format the output
-        for dir_name, dir_files in sorted(files_by_dir.items()):
-            result += f"📁 {dir_name}:\n"
-            for file in sorted(dir_files, key=lambda x: x["name"]):
-                size_kb = round(file["size"] / 1024, 1)
-                result += f"  📄 {file['name']} ({size_kb} KB)\n"
-            result += "\n"
-            
-        return result
-    except Exception as e:
-        return f"Error listing directory: {str(e)}"
+    session = _sessions[session_id]
+    return json.dumps({
+        "session_id": session_id,
+        "history": session.history
+    }, indent=2)
+
 
 # ============================================================================
 # Tools
@@ -460,27 +480,23 @@ def list_python_environments() -> str:
     
     return result
 
+
 @mcp.tool()
 def list_installed_packages(environment: str = "default") -> str:
     """
     List installed packages for a specific Python environment.
     
     Args:
-        environment: Name of the Python environment (default: default if custom path provided, otherwise system)
+        environment: Name of the Python environment
     """
     environments = get_python_environments()
     
-    # Use default environment if a custom path was provided, otherwise use system
-    default_env = "default" if any(e["name"] == "default" for e in environments) else "system"
-    
-    # If environment parameter is default but there's no default environment, use system
     if environment == "default" and not any(e["name"] == "default" for e in environments):
         environment = "system"
     
-    # Find the requested environment
     env = next((e for e in environments if e["name"] == environment), None)
     if not env:
-        return f"Environment '{environment}' not found. Available environments: {', '.join(e['name'] for e in environments)}"
+        return f"Environment '{environment}' not found. Available: {', '.join(e['name'] for e in environments)}"
     
     packages = get_installed_packages(env["path"])
     
@@ -493,178 +509,142 @@ def list_installed_packages(environment: str = "default") -> str:
     
     return result
 
+
 @mcp.tool()
-def run_python_code(
-    code: str, 
-    environment: str = "default",
-    save_as: Optional[str] = None
+async def run_python_code(
+    code: str,
+    execution_mode: str = "inline",
+    session_id: str = "default",
+    environment: str = "system",
+    save_as: Optional[str] = None,
+    timeout: int = 300
 ) -> str:
     """
-    Execute Python code and return the result. Code runs in the working directory.
+    Execute Python code with flexible execution modes.
     
     Args:
         code: Python code to execute
-        environment: Name of the Python environment to use (default if custom path provided, otherwise system)
-        save_as: Optional filename to save the code before execution (useful for future reference)
+        execution_mode: Execution mode - "inline" (default, fast, in-process) or "subprocess" (isolated)
+        session_id: Session ID for inline mode to maintain state across executions
+        environment: Python environment name (only for subprocess mode)
+        save_as: Optional filename to save the code before execution
+        timeout: Maximum execution time in seconds (only enforced for subprocess mode)
+    
+    Returns:
+        Execution result with output
+    
+    Execution modes:
+    - "inline" (default): Executes code in the current process. Fast and reliable,
+      maintains session state. Use for most code execution tasks.
+    - "subprocess": Executes code in a separate Python process. Use when you need
+      environment isolation or a different Python environment.
     """
-    environments = get_python_environments()
     
-    # Use default environment if a custom path was provided, otherwise use system
-    if environment == "default" and not any(e["name"] == "default" for e in environments):
-        environment = "system"
-        
-    # Find the requested environment
-    env = next((e for e in environments if e["name"] == environment), None)
-    if not env:
-        return f"Environment '{environment}' not found. Available environments: {', '.join(e['name'] for e in environments)}"
-    
-    # Optionally save the code to a file
+    # Save code if requested
     if save_as:
         save_path = WORKING_DIR / save_as
-        
-        # Ensure filename has .py extension
         if not save_path.suffix == '.py':
             save_path = save_path.with_suffix('.py')
             
         try:
             save_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(save_path, 'w') as f:
+            with open(save_path, 'w', encoding='utf-8') as f:
                 f.write(code)
         except Exception as e:
             return f"Error saving code to file: {str(e)}"
     
-    # Execute the code
-    result = execute_python_code(code, env["path"], WORKING_DIR)
+    # Execute based on mode
+    if execution_mode == "inline":
+        # In-process execution (default, fast, no subprocess issues)
+        try:
+            session = get_session(session_id)
+            result = session.execute(code, timeout)
+            
+            # Store in history
+            session.history.append({
+                "code": code,
+                "stdout": result["stdout"],
+                "stderr": result["stderr"],
+                "status": result["status"]
+            })
+            
+            output = f"Execution in session '{session_id}' (inline mode)"
+            if save_as:
+                output += f" (saved to {save_as})"
+            output += ":\n\n"
+            
+            if result["status"] == 0:
+                output += "--- Output ---\n"
+                output += result["stdout"] if result["stdout"] else "(No output)\n"
+            else:
+                output += "--- Error ---\n"
+                output += result["stderr"] if result["stderr"] else "(No error message)\n"
+                
+                if result["stdout"]:
+                    output += "\n--- Output ---\n"
+                    output += result["stdout"]
+            
+            return output
+            
+        except Exception as e:
+            return f"Error in inline execution: {str(e)}\n{traceback.format_exc()}"
     
-    output = f"Execution in '{environment}' environment"
-    if save_as:
-        output += f" (saved to {save_as})"
-    output += ":\n\n"
-    
-    if result["status"] == 0:
-        output += "--- Output ---\n"
-        if result["stdout"]:
-            output += result["stdout"]
+    elif execution_mode == "subprocess":
+        # Subprocess execution (for environment isolation)
+        environments = get_python_environments()
+        
+        if environment == "default" and not any(e["name"] == "default" for e in environments):
+            environment = "system"
+            
+        env = next((e for e in environments if e["name"] == environment), None)
+        if not env:
+            return f"Environment '{environment}' not found. Available: {', '.join(e['name'] for e in environments)}"
+        
+        result = await execute_python_code_subprocess(code, env["path"], str(WORKING_DIR), timeout)
+        
+        output = f"Execution in '{environment}' environment (subprocess mode)"
+        if save_as:
+            output += f" (saved to {save_as})"
+        output += ":\n\n"
+        
+        if result["status"] == 0:
+            output += "--- Output ---\n"
+            output += result["stdout"] if result["stdout"] else "(No output)\n"
         else:
-            output += "(No output)\n"
+            output += f"--- Error (status code: {result['status']}) ---\n"
+            output += result["stderr"] if result["stderr"] else "(No error message)\n"
+            
+            if result["stdout"]:
+                output += "\n--- Output ---\n"
+                output += result["stdout"]
+        
+        return output
+    
     else:
-        output += f"--- Error (status code: {result['status']}) ---\n"
-        if result["stderr"]:
-            output += result["stderr"]
-        else:
-            output += "(No error message)\n"
-        
-        if result["stdout"]:
-            output += "\n--- Output ---\n"
-            output += result["stdout"]
-    
-    return output
+        return f"Unknown execution mode: {execution_mode}. Use 'inline' or 'subprocess'."
+
 
 @mcp.tool()
-def install_package(
-    package_name: str,
-    environment: str = "default",
-    upgrade: bool = False
-) -> str:
-    """
-    Install a Python package in the specified environment.
-    
-    Args:
-        package_name: Name of the package to install
-        environment: Name of the Python environment (default if custom path provided, otherwise system)
-        upgrade: Whether to upgrade the package if already installed (default: False)
-    """
-    environments = get_python_environments()
-    
-    # Use default environment if a custom path was provided, otherwise use system
-    if environment == "default" and not any(e["name"] == "default" for e in environments):
-        environment = "system"
-        
-    # Find the requested environment
-    env = next((e for e in environments if e["name"] == environment), None)
-    if not env:
-        return f"Environment '{environment}' not found. Available environments: {', '.join(e['name'] for e in environments)}"
-    
-    # Build the pip command
-    cmd = [env["path"], "-m", "pip", "install"]
-    
-    if upgrade:
-        cmd.append("--upgrade")
-    
-    cmd.append(package_name)
-    
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
-        
-        if result.returncode == 0:
-            return f"Successfully {'upgraded' if upgrade else 'installed'} {package_name} in {environment} environment."
-        else:
-            return f"Error installing {package_name}:\n{result.stderr}"
-    except Exception as e:
-        return f"Error installing package: {str(e)}"
-
-@mcp.tool()
-def write_python_file(
-    file_path: str,
-    content: str,
-    overwrite: bool = False
-) -> str:
-    """
-    Write content to a Python file in the working directory or system-wide if allowed.
-    
-    Args:
-        file_path: Path to the file to write (relative to working directory or absolute if system access is enabled)
-        content: Content to write to the file
-        overwrite: Whether to overwrite the file if it exists (default: False)
-    """
-    # Handle path based on security settings
-    path = Path(file_path)
-    if path.is_absolute():
-        if not is_path_allowed(path):
-            security_status = "DISABLED" if not ALLOW_SYSTEM_ACCESS else "ENABLED, but this path is not allowed"
-            return f"For security reasons, you can only write files inside the working directory: {WORKING_DIR} (System-wide access is {security_status})"
-    else:
-        # Make path relative to working directory if it's not already
-        path = WORKING_DIR / path
-    
-    # Check if the file exists
-    if path.exists() and not overwrite:
-        return f"File '{path}' already exists. Use overwrite=True to replace it."
-    
-    try:
-        # Create directory if it doesn't exist
-        path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Write to file
-        with open(path, 'w') as f:
-            f.write(content)
-        
-        return f"Successfully wrote to {path}."
-    except Exception as e:
-        return f"Error writing to file: {str(e)}"
-
-@mcp.tool()
-def run_python_file(
+async def run_python_file(
     file_path: str,
     environment: str = "default",
-    arguments: Optional[List[str]] = None
+    arguments: Optional[List[str]] = None,
+    timeout: int = 300
 ) -> str:
     """
-    Execute a Python file and return the result.
+    Execute a Python file (always uses subprocess for file execution).
     
     Args:
-        file_path: Path to the Python file to execute (relative to working directory or absolute if system access is enabled)
-        environment: Name of the Python environment to use (default if custom path provided, otherwise system)
+        file_path: Path to the Python file to execute
+        environment: Name of the Python environment to use
         arguments: List of command-line arguments to pass to the script
+        timeout: Maximum execution time in seconds (default: 300)
     """
-    # Handle path based on security settings
     path = Path(file_path)
     if path.is_absolute():
         if not is_path_allowed(path):
-            security_status = "DISABLED" if not ALLOW_SYSTEM_ACCESS else "ENABLED, but this path is not allowed"
-            return f"For security reasons, you can only run files inside the working directory: {WORKING_DIR} (System-wide access is {security_status})"
+            return f"Access denied: Can only run files in working directory: {WORKING_DIR}"
     else:
-        # Make path relative to working directory if it's not already
         path = WORKING_DIR / path
     
     if not path.exists():
@@ -672,53 +652,251 @@ def run_python_file(
     
     environments = get_python_environments()
     
-    # Use default environment if a custom path was provided, otherwise use system
     if environment == "default" and not any(e["name"] == "default" for e in environments):
         environment = "system"
         
-    # Find the requested environment
     env = next((e for e in environments if e["name"] == environment), None)
     if not env:
-        return f"Environment '{environment}' not found. Available environments: {', '.join(e['name'] for e in environments)}"
+        return f"Environment '{environment}' not found. Available: {', '.join(e['name'] for e in environments)}"
     
-    # Build the command
     cmd = [env["path"], str(path)]
-    
     if arguments:
         cmd.extend(arguments)
     
+    result = await run_subprocess_async(cmd, cwd=str(WORKING_DIR), timeout=timeout)
+    
+    output = f"Execution of '{path}' in '{environment}' environment:\n\n"
+    
+    if result["status"] == 0:
+        output += "--- Output ---\n"
+        output += result["stdout"] if result["stdout"] else "(No output)\n"
+    else:
+        output += f"--- Error (status code: {result['status']}) ---\n"
+        output += result["stderr"] if result["stderr"] else "(No error message)\n"
+        
+        if result["stdout"]:
+            output += "\n--- Output ---\n"
+            output += result["stdout"]
+    
+    return output
+
+
+@mcp.tool()
+async def install_package(
+    package_name: str,
+    environment: str = "default",
+    upgrade: bool = False,
+    timeout: int = 300
+) -> str:
+    """
+    Install a Python package in the specified environment.
+    
+    Args:
+        package_name: Name of the package to install
+        environment: Name of the Python environment
+        upgrade: Whether to upgrade if already installed
+        timeout: Maximum execution time in seconds
+    """
+    environments = get_python_environments()
+    
+    if environment == "default" and not any(e["name"] == "default" for e in environments):
+        environment = "system"
+        
+    env = next((e for e in environments if e["name"] == environment), None)
+    if not env:
+        return f"Environment '{environment}' not found. Available: {', '.join(e['name'] for e in environments)}"
+    
+    cmd = [env["path"], "-m", "pip", "install"]
+    if upgrade:
+        cmd.append("--upgrade")
+    cmd.append(package_name)
+    
+    result = await run_subprocess_async(cmd, timeout=timeout)
+    
+    if result["status"] == 0:
+        return f"Successfully {'upgraded' if upgrade else 'installed'} {package_name} in {environment}."
+    else:
+        return f"Error installing {package_name}:\n{result['stderr']}"
+
+
+@mcp.tool()
+def read_file(file_path: str, max_size_kb: int = 1024) -> str:
+    """
+    Read the content of any file, with size limits for safety.
+    
+    Args:
+        file_path: Path to the file
+        max_size_kb: Maximum file size to read in KB
+    """
+    path = Path(file_path)
+    if path.is_absolute():
+        if not is_path_allowed(path):
+            return f"Access denied: Can only read files in working directory: {WORKING_DIR}"
+    else:
+        path = WORKING_DIR / path
+    
     try:
-        # Run the command with working directory set properly
-        result = subprocess.run(
-            cmd, 
-            capture_output=True, 
-            text=True, 
-            check=False,
-            cwd=WORKING_DIR
-        )
+        if not path.exists():
+            return f"Error: File '{file_path}' not found"
         
-        output = f"Execution of '{path}' in '{environment}' environment:\n\n"
+        file_size_kb = path.stat().st_size / 1024
+        if file_size_kb > max_size_kb:
+            return f"Error: File size ({file_size_kb:.2f} KB) exceeds maximum ({max_size_kb} KB)"
         
-        if result.returncode == 0:
-            output += "--- Output ---\n"
-            if result.stdout:
-                output += result.stdout
-            else:
-                output += "(No output)\n"
-        else:
-            output += f"--- Error (status code: {result.returncode}) ---\n"
-            if result.stderr:
-                output += result.stderr
-            else:
-                output += "(No error message)\n"
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                content = f.read()
             
-            if result.stdout:
-                output += "\n--- Output ---\n"
-                output += result.stdout
+            source_extensions = ['.py', '.js', '.html', '.css', '.json', '.xml', '.md', '.txt', '.sh', '.bat', '.ps1']
+            if path.suffix.lower() in source_extensions:
+                file_type = path.suffix[1:] if path.suffix else 'plain'
+                return f"File: {file_path}\n\n```{file_type}\n{content}\n```"
+            
+            return f"File: {file_path}\n\n{content}"
         
-        return output
+        except UnicodeDecodeError:
+            with open(path, 'rb') as f:
+                content = f.read()
+                hex_content = content.hex()
+                return f"Binary file: {file_path}\nSize: {len(content)} bytes\nHex (first 1024 chars):\n{hex_content[:1024]}"
+    
     except Exception as e:
-        return f"Error executing file: {str(e)}"
+        return f"Error reading file: {str(e)}"
+
+
+@mcp.tool()
+def write_file(
+    file_path: str,
+    content: str,
+    overwrite: bool = False
+) -> str:
+    """
+    Write content to a file.
+    
+    Args:
+        file_path: Path to the file to write
+        content: Content to write
+        overwrite: Whether to overwrite if exists
+    """
+    path = Path(file_path)
+    if path.is_absolute():
+        if not is_path_allowed(path):
+            return f"Access denied: Can only write files in working directory: {WORKING_DIR}"
+    else:
+        path = WORKING_DIR / path
+    
+    try:
+        if path.exists() and not overwrite:
+            return f"File '{path}' exists. Use overwrite=True to replace."
+        
+        path.parent.mkdir(parents=True, exist_ok=True)
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        
+        file_size_kb = path.stat().st_size / 1024
+        return f"Successfully wrote to {path}. Size: {file_size_kb:.2f} KB"
+    
+    except Exception as e:
+        return f"Error writing file: {str(e)}"
+
+
+@mcp.tool()
+def list_directory(directory_path: str = "") -> str:
+    """
+    List all Python files in a directory.
+    
+    Args:
+        directory_path: Path to directory (empty for working directory)
+    """
+    try:
+        if not directory_path:
+            path = WORKING_DIR
+        else:
+            path = Path(directory_path)
+            if path.is_absolute():
+                if not is_path_allowed(path):
+                    return f"Access denied: Can only list files in working directory: {WORKING_DIR}"
+            else:
+                path = WORKING_DIR / directory_path
+                
+        if not path.exists():
+            return f"Error: Directory '{directory_path}' not found"
+            
+        if not path.is_dir():
+            return f"Error: '{directory_path}' is not a directory"
+            
+        files = find_python_files(path)
+        
+        if not files:
+            return f"No Python files found in {directory_path or 'working directory'}"
+            
+        result = f"Python files in: {directory_path or str(WORKING_DIR)}\n\n"
+        
+        files_by_dir = {}
+        base_dir = path if ALLOW_SYSTEM_ACCESS else WORKING_DIR
+        
+        for file in files:
+            file_path = Path(file["path"])
+            try:
+                relative_path = file_path.relative_to(base_dir)
+                parent = str(relative_path.parent)
+                if parent == ".":
+                    parent = "(root)"
+            except ValueError:
+                parent = str(file_path.parent)
+                
+            if parent not in files_by_dir:
+                files_by_dir[parent] = []
+                
+            files_by_dir[parent].append({
+                "name": file["name"],
+                "size": file["size"]
+            })
+            
+        for dir_name, dir_files in sorted(files_by_dir.items()):
+            result += f"📁 {dir_name}:\n"
+            for file in sorted(dir_files, key=lambda x: x["name"]):
+                size_kb = round(file["size"] / 1024, 1)
+                result += f"  📄 {file['name']} ({size_kb} KB)\n"
+            result += "\n"
+            
+        return result
+    except Exception as e:
+        return f"Error listing directory: {str(e)}"
+
+
+@mcp.tool()
+def clear_session(session_id: str = "default") -> str:
+    """
+    Clear a REPL session's state and history.
+    
+    Args:
+        session_id: Session ID to clear
+    """
+    if session_id in _sessions:
+        del _sessions[session_id]
+        return f"Session '{session_id}' cleared."
+    else:
+        return f"Session '{session_id}' not found."
+
+
+@mcp.tool()
+def list_sessions() -> str:
+    """List all active REPL sessions."""
+    if not _sessions:
+        return "No active sessions."
+    
+    result = "Active REPL Sessions:\n\n"
+    for session_id, session in _sessions.items():
+        result += f"- Session: {session_id}\n"
+        result += f"  History entries: {len(session.history)}\n"
+        result += f"  Variables: {len([k for k in session.locals.keys() if not k.startswith('__')])}\n\n"
+    
+    return result
+
 
 # ============================================================================
 # Prompts
@@ -727,8 +905,7 @@ def run_python_file(
 @mcp.prompt()
 def python_function_template(description: str) -> str:
     """Generate a template for a Python function with docstring."""
-    return f"""
-Please create a Python function based on this description:
+    return f"""Please create a Python function based on this description:
 
 {description}
 
@@ -736,32 +913,25 @@ Include:
 - Type hints
 - Docstring with parameters, return value, and examples
 - Error handling where appropriate
-- Comments for complex logic
-"""
+- Comments for complex logic"""
+
 
 @mcp.prompt()
 def refactor_python_code(code: str) -> str:
     """Help refactor Python code for better readability and performance."""
-    return f"""
-Please refactor this Python code to improve:
-- Readability
-- Performance
-- Error handling
-- Code structure
+    return f"""Please refactor this Python code to improve readability, performance, error handling, and structure:
 
-Original code:
 ```python
 {code}
 ```
 
-Please explain the changes you made and why they improve the code.
-"""
+Explain the changes you made and why they improve the code."""
+
 
 @mcp.prompt()
 def debug_python_error(code: str, error_message: str) -> str:
     """Help debug a Python error."""
-    return f"""
-I'm getting this error when running the following Python code:
+    return f"""I'm getting this error:
 
 ```python
 {code}
@@ -772,12 +942,12 @@ Error message:
 {error_message}
 ```
 
-Please help me debug this error by:
+Please help by:
 1. Explaining what the error means
-2. Identifying the cause of the error
-3. Suggesting fixes to resolve the error
-"""
+2. Identifying the cause
+3. Suggesting fixes"""
 
-# Run the server when executed directly
+
+# Run the server
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport='stdio')
