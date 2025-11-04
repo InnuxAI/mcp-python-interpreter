@@ -5,7 +5,7 @@ from mcp_python_interpreter.server import mcp
 
 def main():
     """Run the MCP Python Interpreter server."""
-    mcp.run(transport='stdio')
+    mcp.run(transport='streamable-http')
 
 
 if __name__ == "__main__":
